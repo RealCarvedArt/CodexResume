@@ -23,7 +23,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on push to `main` and on every pul
 | Hostile input | v1.0.0 `CodexResume.ps1` | 4 checks fail, exit 1 |
 | Hostile input | v1.1 `CodexResume.ps1` | 17 pass, exit 0 |
 
-Not yet verified: the workflow running on GitHub's own runners. It has not been pushed.
+Verified on GitHub's runners: both jobs green on PR #1 (2026-10-12).
 
 ## Suppression log
 None.
