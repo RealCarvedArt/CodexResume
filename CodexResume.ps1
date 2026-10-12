@@ -5,10 +5,15 @@
 
   Data source: the rate_limits events Codex CLI writes into
   %USERPROFILE%\.codex\sessions\**\*.jsonl (or $env:CODEX_HOME\sessions).
-  Settings and log: %APPDATA%\CodexResume\
+  Settings and log: %LOCALAPPDATA%\CodexResume\
 #>
 #Requires -Version 5.1
 $ErrorActionPreference = 'Stop'
+# Started from PowerShell 7, Windows PowerShell inherits PS7's module folders and
+# then cannot load its own built-in modules (CIM, security). Drop those folders.
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '\\PowerShell\\7|\\powershell\\Modules$' }) -join ';'
+}
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [Windows.Forms.Application]::EnableVisualStyles()
 
@@ -20,16 +25,39 @@ Add-Type -Namespace CodexResume -Name Native -MemberDefinition @'
 [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 '@
+# Windows PowerShell by full path (not PATH, and not $PSHOME, which is PowerShell 7's folder under pwsh).
+$WinPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $ES_CONTINUOUS      = [uint32]2147483648
 $ES_KEEP_AWAKE      = [uint32]2147483649   # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
 
 # ---------------------------------------------------------------- paths -----
-$ConfigDir    = Join-Path $env:APPDATA 'CodexResume'
+# Local, not Roaming: the log names project folders, and roaming profiles
+# would copy it to a file server.
+$ConfigDir    = Join-Path $env:LOCALAPPDATA 'CodexResume'
 $ConfigPath   = Join-Path $ConfigDir 'config.json'
 $LogPath      = Join-Path $ConfigDir 'resume.log'
 $CodexHome    = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 $SessionsPath = Join-Path $CodexHome 'sessions'
+$OldConfigDir = Join-Path $env:APPDATA 'CodexResume'
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+# Move from the Roaming folder used before v1.1. Only settings are kept: the
+# old log could hold prompts, full paths and the reset command, so it is
+# deleted, as are the old helpers. Retried on every start until it succeeds.
+# Only files this app made are removed; the folder goes only if nothing else is left.
+if (Test-Path -LiteralPath $OldConfigDir) {
+    try {
+        $oldCfg = Join-Path $OldConfigDir 'config.json'
+        if ((Test-Path -LiteralPath $oldCfg) -and -not (Test-Path -LiteralPath (Join-Path $ConfigDir 'config.json'))) {
+            Copy-Item -LiteralPath $oldCfg -Destination (Join-Path $ConfigDir 'config.json')
+        }
+        $known = '^(config\.json(\.bad-.*|\.tmp)?|resume\.log(\.1)?|run-resume\.(ps1|json)|reset-command\.ps1|TypeIntoCodex(-v\d+)?\.(cs|exe)|type-into-codex\.ps1)$'
+        Get-ChildItem -LiteralPath $OldConfigDir -File -Force | Where-Object { $_.Name -match $known } | Remove-Item -Force
+        if (-not (Get-ChildItem -LiteralPath $OldConfigDir -Force)) { Remove-Item -LiteralPath $OldConfigDir -Force }
+    } catch { }
+}
+# Files left behind by a runner or reset command that never finished (they
+# hold the folder and prompt, or the reset command).
+foreach ($f in 'run-resume.json', 'reset-command.ps1') { Remove-Item -LiteralPath (Join-Path $ConfigDir $f) -ErrorAction SilentlyContinue }
 
 # ---------------------------------------------------------------- config ----
 function Load-Config {
@@ -58,15 +86,20 @@ function Load-Config {
         ContinueMode        = 'Type'
         TypeCharDelayMs     = 35      # gap between typed letters
         TypeEnterDelayMs    = 600     # pause before Enter, so Codex does not treat it as a paste
-        MaxContinues        = 0       # stop after this many automatic continues; 0 = no limit
+        MaxContinues        = 10      # stop after this many automatic continues per run; 0 = no limit
         TargetPid           = 0       # which Codex window to type into when several are open
-        ConfigVersion       = 2
+        TargetStarted       = ''      # start time of that window, so a reused process id is not mistaken for it
+        DetailsOpen         = $false  # show the Details panel
+        ConfigVersion       = 3
         InteractiveTemplate = 'codex resume {session} {prompt}'
         BackgroundTemplate  = 'codex exec --skip-git-repo-check resume {session} {prompt}'
         CloseOpenCodex      = $true   # close a still-open Codex first (it locks the session)
         # Codex usually logs 99% (not 100%) before refusing, so arm at this level.
         # A "You've hit your usage limit" error in the logs also arms it.
         LimitThreshold  = 99
+        # Codex only logs usage while it is working. Past this age the status
+        # says the numbers may be out of date instead of "OK".
+        StaleMinutes    = 30
         # Banked reset credits. OpenAI only documents redeeming these in
         # Settings > Usage (Codex app or web). If you have a script that redeems
         # one, put it in UseResetCommand; it must exit 0 on success. Leave it
@@ -80,23 +113,78 @@ function Load-Config {
         ResetsOnHand        = -1
         ResetExpires        = ''      # date your next reset expires, e.g. 2026-11-06
     }
+    $defaults = $cfg.Clone()
     if (Test-Path -LiteralPath $ConfigPath) {
         try {
             $j = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
             foreach ($p in $j.PSObject.Properties) { $cfg[$p.Name] = $p.Value }
-        } catch { }
+        } catch {
+            # Keep the broken file for the user, and start safely: no automatic actions.
+            # Only the newest broken copy is kept; it may hold your prompt and reset command.
+            $bad = '{0}.bad-{1:yyyyMMdd-HHmmss}' -f $ConfigPath, (Get-Date)
+            $cfg.AutoResume = $false
+            try {
+                Copy-Item -LiteralPath $ConfigPath -Destination $bad
+                Get-ChildItem -LiteralPath $ConfigDir -Filter 'config.json.bad-*' | Where-Object { $_.FullName -ne $bad } | Remove-Item -ErrorAction SilentlyContinue
+                $script:ConfigError = "config.json could not be read, so auto-continue is off. Your old file was saved as $(Split-Path $bad -Leaf)."
+            } catch {
+                # No copy, so never overwrite the original: settings are not saved this run.
+                $script:ConfigReadOnly = $true
+                $script:ConfigError = 'config.json could not be read or backed up, so auto-continue is off and settings will not be saved. Fix or delete config.json.'
+            }
+        }
+    }
+    # A value of the wrong type falls back to its default instead of crashing later.
+    foreach ($k in @($defaults.Keys)) {
+        $d = $defaults[$k]; $v = $cfg[$k]
+        if ($d -is [bool]) {
+            if ($v -isnot [bool]) { $cfg[$k] = $d }
+        } elseif ($d -is [int]) {
+            $n = 0.0
+            if ([double]::TryParse([string]$v, [ref]$n) -and [Math]::Abs($n) -lt 1e9) { $cfg[$k] = [int]$n } else { $cfg[$k] = $d }
+        } elseif ($null -eq $v -or $v -isnot [string]) { $cfg[$k] = $d }
     }
     # Configs saved before typing mode existed: switch them to it.
     $ver = 1; try { if ($j -and $j.ConfigVersion) { $ver = [int]$j.ConfigVersion } } catch { }
     if ($ver -lt 2) { $cfg.ContinueMode = 'Type'; $cfg.ConfigVersion = 2 }
+    # Before v1.1 every config was saved with MaxContinues 0 (no limit), the old
+    # default; give those the new limit of 10 once. 0 set from now on is kept.
+    if ($ver -lt 3) {
+        if ([int]$cfg.MaxContinues -eq 0) { $cfg.MaxContinues = 10 }
+        $cfg.ConfigVersion = 3
+    }
+    # Re-reading every session file more often than every 5 seconds only costs CPU.
+    if ([int]$cfg.RefreshSeconds -lt 5) { $cfg.RefreshSeconds = 5 }
     # Older versions used a single CommandTemplate; replaced by the modes.
     if ($cfg.ContainsKey('CommandTemplate')) { $cfg.Remove('CommandTemplate') }
     $cfg
 }
-function Save-Config { $script:Config | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath -Encoding UTF8 }
-function Write-Log([string]$msg) {
-    Add-Content -LiteralPath $LogPath -Value ('[{0:yyyy-MM-dd HH:mm:ss}] {1}' -f (Get-Date), $msg)
+# Write to a temporary file and swap it in, so a crash never leaves a half-written config.
+function Save-Config {
+    if ($script:ConfigReadOnly) { return }
+    $tmp = "$ConfigPath.tmp"
+    $script:Config | ConvertTo-Json | Set-Content -LiteralPath $tmp -Encoding UTF8
+    if (Test-Path -LiteralPath $ConfigPath) { [IO.File]::Replace($tmp, $ConfigPath, [NullString]::Value) }
+    else { [IO.File]::Move($tmp, $ConfigPath) }
 }
+# The log keeps one previous file at 1 MB, and repeats of the same message
+# within 10 minutes are dropped. Line breaks are removed so a value cannot
+# forge extra log lines.
+$script:LastLog = @{ Msg = $null; At = [datetime]::MinValue }
+function Write-Log([string]$msg) {
+    # Error texts can contain full paths; hide the profile folder (it names the user).
+    $msg = $msg -replace '[\r\n]+', ' '
+    if ($env:USERPROFILE) { $msg = $msg -ireplace [regex]::Escape($env:USERPROFILE), '%USERPROFILE%' }
+    $now = Get-Date
+    if ($msg -eq $script:LastLog.Msg -and ($now - $script:LastLog.At).TotalMinutes -lt 10) { return }
+    $script:LastLog = @{ Msg = $msg; At = $now }
+    if ((Test-Path -LiteralPath $LogPath) -and (Get-Item -LiteralPath $LogPath).Length -gt 1MB) {
+        Move-Item -LiteralPath $LogPath -Destination "$LogPath.1" -Force
+    }
+    Add-Content -LiteralPath $LogPath -Value ('[{0:yyyy-MM-dd HH:mm:ss}] {1}' -f $now, $msg)
+}
+# Last part of a path, for the log and notifications (the full path stays in the window).
+function Get-Leaf([string]$path) { if ($path) { Split-Path $path -Leaf } else { '' } }
 
 # ------------------------------------------------------- reading Codex data --
 function Read-Tail([string]$path, [int]$bytes = 524288) {
@@ -111,6 +199,19 @@ function Read-Tail([string]$path, [int]$bytes = 524288) {
     $lines = $text -split "`r?`n"
     if ($start -gt 0 -and $lines.Count -gt 1) { $lines = $lines[1..($lines.Count - 1)] }
     $lines
+}
+
+# Windows does not update a file's LastWriteTime while Codex keeps it open, so
+# a long-running session can look a day old while it is still being written.
+# Take every session touched (or created) in the last 8 days, which covers the
+# weekly window; callers rank by the event timestamps inside the files.
+function Get-SessionFiles {
+    $all = @(Get-ChildItem -LiteralPath $SessionsPath -Recurse -Filter '*.jsonl' -File -ErrorAction SilentlyContinue |
+             Sort-Object LastWriteTime -Descending)
+    $cut = (Get-Date).AddDays(-8)
+    $recent = @($all | Where-Object { $_.LastWriteTime -gt $cut })
+    if ($recent.Count -lt 5) { $recent = @($all | Select-Object -First 5) }
+    $recent
 }
 
 function Get-EventTime($o, [datetime]$fallback) {
@@ -128,6 +229,12 @@ function Convert-Window($w, [datetime]$eventTime) {
     } elseif ($null -ne $w.resets_in_seconds) {
         $reset = $eventTime.AddSeconds([double]$w.resets_in_seconds)
     }
+    # A window cannot reset later than its own length after the event; a later
+    # time is bad or planted data, so it is not used to arm a resume.
+    # Without a window length, the longest Codex window (one week) is the limit.
+    $mins = 0.0
+    if (-not ([double]::TryParse([string]$w.window_minutes, [ref]$mins) -and $mins -gt 0)) { $mins = 10080 }
+    if ($reset -and $reset -gt $eventTime.AddMinutes($mins + 10)) { $reset = $null }
     [pscustomobject]@{ Used = [double]$w.used_percent; Minutes = $w.window_minutes; ResetAt = $reset }
 }
 
@@ -187,12 +294,11 @@ $LimitPattern = "hit your usage limit|usage_limit_reached|usage limit reached"
 # Looks in recent session logs and in Codex's own log file.
 function Find-LimitError($files, [datetime]$since) {
     $found = $null
+    # No LastWriteTime shortcut here: it is stale for files Codex has open.
     foreach ($f in $files) {
-        if ($f.LastWriteTime -le $since) { continue }
-        foreach ($line in (Read-Tail $f.FullName 262144)) {
-            if ($line -notmatch $LimitPattern) { continue }
-            $t = $null
-            try { $t = Get-EventTime ($line | ConvertFrom-Json) $f.LastWriteTime } catch { $t = $f.LastWriteTime }
+        $sum = $script:SessionCache[$f.FullName]
+        if (-not $sum) { continue }
+        foreach ($t in $sum.LimitTimes) {
             if ($t -gt $since -and (-not $found -or $t -gt $found)) { $found = $t }
         }
     }
@@ -223,37 +329,36 @@ function Get-SessionCwd([string]$path, $tailLines) {
         try { $o = $tailLines[$i] | ConvertFrom-Json } catch { continue }
         foreach ($c in @($o.payload.cwd, $o.cwd)) { if ($c) { return [string]$c } }
     }
+    foreach ($line in (Read-Head $path 50)) {
+        if ($line -notmatch '"cwd"') { continue }
+        try { $o = $line | ConvertFrom-Json } catch { continue }
+        foreach ($c in @($o.payload.cwd, $o.cwd)) { if ($c) { return [string]$c } }
+    }
+    $null
+}
+
+# First $maxLines lines, reading at most 1 MB, so one huge line cannot exhaust memory.
+function Read-Head([string]$path, [int]$maxLines) {
     try {
         $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
         try {
-            $sr = New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)
-            for ($n = 0; $n -lt 50; $n++) {
-                $line = $sr.ReadLine(); if ($null -eq $line) { break }
-                if ($line -notmatch '"cwd"') { continue }
-                try { $o = $line | ConvertFrom-Json } catch { continue }
-                foreach ($c in @($o.payload.cwd, $o.cwd)) { if ($c) { return [string]$c } }
-            }
+            $buf = New-Object byte[] ([int][Math]::Min([long]1MB, $fs.Length))
+            $got = 0
+            while ($got -lt $buf.Length) { $r = $fs.Read($buf, $got, $buf.Length - $got); if ($r -le 0) { break }; $got += $r }
         } finally { $fs.Dispose() }
-    } catch { }
-    $null
+        @([Text.Encoding]::UTF8.GetString($buf, 0, $got) -split "`r?`n" | Select-Object -First $maxLines)
+    } catch { @() }
 }
 
 # Session id: the UUID at the end of the rollout file name, or session_meta id.
 function Get-SessionId([string]$path) {
     $name = [IO.Path]::GetFileNameWithoutExtension($path)
     if ($name -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$') { return $Matches[1] }
-    try {
-        $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
-        try {
-            $sr = New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)
-            for ($n = 0; $n -lt 20; $n++) {
-                $line = $sr.ReadLine(); if ($null -eq $line) { break }
-                if ($line -notmatch 'session_meta') { continue }
-                $o = $line | ConvertFrom-Json
-                if ($o.payload.id) { return [string]$o.payload.id }
-            }
-        } finally { $fs.Dispose() }
-    } catch { }
+    foreach ($line in (Read-Head $path 20)) {
+        if ($line -notmatch 'session_meta') { continue }
+        try { $o = $line | ConvertFrom-Json } catch { continue }
+        if ($o.payload.id) { return [string]$o.payload.id }
+    }
     $null
 }
 
@@ -278,13 +383,27 @@ function Get-CodexSubcommand([string]$cmdLine) {
 # Interactive Codex terminal sessions. Each result has ProcessId, Started and
 # Host (the terminal it runs in). Skips background servers and anything that
 # runs under another Codex process.
+# Only processes in this Windows session count, so another signed-in user's
+# Codex is never typed into. Command lines are read only for Codex processes.
 function Get-OpenCodex {
-    try { $all = @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch { return @() }
+    try {
+        # A timeout, so a stuck WMI service cannot hold the scan forever.
+        $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, SessionId -OperationTimeoutSec 10 -ErrorAction Stop)
+        # One query, filtered by WMI itself, for the command lines of Codex processes only.
+        $cmdLines = @{}
+        foreach ($c in @(Get-CimInstance Win32_Process -Filter "Name LIKE 'codex%'" -Property ProcessId, CommandLine -OperationTimeoutSec 10 -ErrorAction Stop)) {
+            $cmdLines[[int]$c.ProcessId] = [string]$c.CommandLine
+        }
+    } catch { return @() }
+    $mySession = [Diagnostics.Process]::GetCurrentProcess().SessionId
     $byId = @{}; foreach ($p in $all) { $byId[[int]$p.ProcessId] = $p }
     $isCodex = { param($p) $p -and $p.Name -like 'codex*.exe' }
     $out = foreach ($p in $all) {
         if (-not (& $isCodex $p)) { continue }
-        if ($NonTuiCommands -contains (Get-CodexSubcommand ([string]$p.CommandLine))) { continue }
+        if ([int]$p.SessionId -ne $mySession) { continue }
+        # Started between the two queries: skip it until the next scan sees it fully.
+        if (-not $cmdLines.ContainsKey([int]$p.ProcessId)) { continue }
+        if ($NonTuiCommands -contains (Get-CodexSubcommand $cmdLines[[int]$p.ProcessId])) { continue }
         # Walk up the parent chain: skip helpers, and note the terminal.
         $under = $false; $hostApp = $null; $shell = $null
         $cur = $byId[[int]$p.ParentProcessId]; $hops = 0
@@ -308,10 +427,11 @@ function Get-OpenCodex {
         if ($under) { continue }
         $where = if ($hostApp -and $shell) { "$shell in $hostApp" } elseif ($hostApp) { $hostApp } elseif ($shell) { "$shell window" } else { 'console window' }
         $started = $null; try { $started = [datetime]$p.CreationDate } catch { }
-        [pscustomobject]@{ ProcessId = [int]$p.ProcessId; Started = $started; Host = $where; CommandLine = [string]$p.CommandLine }
+        [pscustomobject]@{ ProcessId = [int]$p.ProcessId; Started = $started; Host = $where }
     }
     @($out)
 }
+function Format-StartKey($started) { if ($started) { $started.ToString('o') } else { '' } }
 
 function Format-CodexChoice($c) {
     $t = if ($c.Started) { '{0:ddd h:mm tt}' -f $c.Started } else { 'unknown time' }
@@ -323,7 +443,9 @@ function Format-CodexChoice($c) {
 function Get-TargetCodex {
     $open = @(Get-OpenCodex)
     $pick = [int]$script:Config.TargetPid
-    $t = $open | Where-Object { $_.ProcessId -eq $pick } | Select-Object -First 1
+    # Same id and same start time: a new process that reused the id is not your pick.
+    $t = $open | Where-Object { $_.ProcessId -eq $pick -and (Format-StartKey $_.Started) -eq [string]$script:Config.TargetStarted } |
+         Select-Object -First 1
     if (-not $t -and $open.Count -eq 1) { $t = $open[0] }
     [pscustomobject]@{ Target = $t; Open = $open }
 }
@@ -332,7 +454,7 @@ function Get-TargetCodex {
 # attaches to the Codex console and writes key presses into its input, exactly
 # as if typed on the keyboard. No window focus needed, and it cannot type into
 # any other window. Compiled once with the C# compiler built into Windows.
-$TypeHelperVersion = 2
+$TypeHelperVersion = 3
 $TypeHelperSource = @'
 using System;
 using System.Runtime.InteropServices;
@@ -379,11 +501,14 @@ static class TypeIntoCodex {
         return WriteConsoleInputW(h, recs, (uint)recs.Length, out written) && written == 2;
     }
 
-    // Arguments: <pid> <text> [charDelayMs] [enterDelayMs]
+    // Arguments: <pid> <text, or - to read it from stdin as UTF-8> [charDelayMs] [enterDelayMs]
     static int Main(string[] a) {
         if (a.Length < 2) return 10;
         uint pid; if (!uint.TryParse(a[0], out pid)) return 10;
         string text = a[1];
+        if (text == "-") {
+            using (var r = new System.IO.StreamReader(Console.OpenStandardInput(), new System.Text.UTF8Encoding(false))) text = r.ReadToEnd();
+        }
         int charDelay = 35, enterDelay = 600;
         if (a.Length > 2) int.TryParse(a[2], out charDelay);
         if (a.Length > 3) int.TryParse(a[3], out enterDelay);
@@ -423,7 +548,13 @@ function Ensure-TypeHelper {
             Add-Type -TypeDefinition $TypeHelperSource -OutputAssembly $TypeHelperExe -OutputType WindowsApplication
         }
     } catch { Write-Log "Helper build failed: $($_.Exception.Message)" }
-    Test-Path -LiteralPath $TypeHelperExe
+    $ok = Test-Path -LiteralPath $TypeHelperExe
+    # Older helper versions are no longer used.
+    if ($ok) {
+        Get-ChildItem -LiteralPath $ConfigDir -Filter 'TypeIntoCodex-v*.exe' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $TypeHelperExe } | Remove-Item -ErrorAction SilentlyContinue
+    }
+    $ok
 }
 
 # Types $text + Enter into the console of Codex process $procId. Returns $true on success.
@@ -433,12 +564,15 @@ function Send-ToCodex([int]$procId, [string]$text) {
     if (-not (Ensure-TypeHelper)) { $script:TypeExit = 20; return $false }
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = $TypeHelperExe
-    # Windows argument quoting: escape quotes, and double backslashes before a quote or the end.
-    $quoted = '"' + (($text -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
-    $psi.Arguments = '{0} {1} {2} {3}' -f $procId, $quoted, [int]$script:Config.TypeCharDelayMs, [int]$script:Config.TypeEnterDelayMs
+    # The prompt goes through stdin, so it never appears on a process command line.
+    $psi.Arguments = '{0} - {1} {2}' -f $procId, [int]$script:Config.TypeCharDelayMs, [int]$script:Config.TypeEnterDelayMs
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
     $p = [Diagnostics.Process]::Start($psi)
+    $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($text)
+    # If the helper already quit (e.g. bad arguments), writing fails; its exit code says why.
+    try { $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length); $p.StandardInput.Close() } catch { }
     if (-not $p.WaitForExit(30000)) { try { $p.Kill() } catch { }; $script:TypeExit = -1; return $false }
     $script:TypeExit = $p.ExitCode
     $p.ExitCode -eq 0
@@ -458,10 +592,8 @@ function Resolve-Codex {
         if (Test-Path -LiteralPath $cfgPath -PathType Leaf) { return $cfgPath }
         return $null
     }
-    Update-PathFromRegistry
-    $cmd = Get-Command codex -CommandType Application -ErrorAction SilentlyContinue |
-           Where-Object { $_.Source -match '\.(cmd|exe|bat)$' } | Select-Object -First 1
-    if ($cmd) { return $cmd.Source }
+    # Known per-user install locations first, then PATH, so a codex planted in
+    # a shared PATH folder is not preferred over your own install.
     $candidates = @(
         "$env:APPDATA\npm\codex.cmd"
         "$env:LOCALAPPDATA\Microsoft\WinGet\Links\codex.exe"
@@ -480,48 +612,147 @@ function Resolve-Codex {
         $hit = Get-ChildItem -LiteralPath $nvm -Filter 'codex.cmd' -Recurse -Depth 2 -File -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($hit) { return $hit.FullName }
     }
+    Update-PathFromRegistry
+    $cmd = Get-Command codex -CommandType Application -ErrorAction SilentlyContinue |
+           Where-Object { $_.Source -match '\.(cmd|exe|bat)$' } | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
     $null
+}
+
+# How to start Codex. npm's codex.cmd goes through cmd.exe, which reinterprets
+# & | % and quotes inside the prompt, so node runs codex.js directly instead.
+function Get-CodexLaunch([string]$codex) {
+    if ($codex -match '\.(cmd|bat)$') {
+        $dir = Split-Path $codex
+        $js = Join-Path $dir 'node_modules\@openai\codex\bin\codex.js'
+        if (Test-Path -LiteralPath $js) {
+            $node = @((Join-Path $dir 'node.exe'), "$env:ProgramFiles\nodejs\node.exe") |
+                    Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            if (-not $node) {
+                # node from PATH only when no other account can change its folder.
+                $node = (Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+                if ($node -and (Test-OthersCanWrite (Split-Path $node))) { $node = $null }
+            }
+            if ($node) { return [pscustomobject]@{ Program = $node; Prefix = @($js) } }
+        }
+    }
+    [pscustomobject]@{ Program = $codex; Prefix = @() }
+}
+
+# $true when an account other than you, SYSTEM, Administrators or
+# TrustedInstaller may change $path (or what is created inside it), or owns it.
+# When the permissions cannot be read, it says $true: better a warning than none.
+function Test-OthersCanWrite([string]$path) {
+    try {
+        # .NET Framework (Windows PowerShell); PowerShell 7 has only Get-Acl.
+        $acl = if ([IO.Directory].GetMethod('GetAccessControl', [type[]]@([string], [Security.AccessControl.AccessControlSections]))) {
+            if (Test-Path -LiteralPath $path -PathType Container) { [IO.Directory]::GetAccessControl($path, 'Access, Owner') }
+            else { [IO.File]::GetAccessControl($path, 'Access, Owner') }
+        } else { Get-Acl -LiteralPath $path }
+    } catch { return $true }
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $trusted = @($me, 'S-1-5-18', 'S-1-5-32-544', 'S-1-3-0',
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    try { if ($trusted -notcontains $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) { return $true } } catch { return $true }
+    # Write, append, delete child, write attributes, delete, change permissions,
+    # take ownership, plus generic write/all.
+    $mask = 0x2 -bor 0x4 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40000000 -bor 0x10000000
+    foreach ($r in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ([string]$r.AccessControlType -ne 'Allow') { continue }
+        if (([long]$r.FileSystemRights -band $mask) -eq 0) { continue }
+        if ($trusted -notcontains $r.IdentityReference.Value) { return $true }
+    }
+    $false
 }
 
 # Folder Codex will be resumed in.
 function Get-ResumeFolder {
+    # The cwd comes from a session file, so only accept a local drive path. A
+    # UNC path (\\host\share) would make Test-Path log in to that host.
     if ($script:Config.FollowSession -and $script:Limits -and $script:Limits.Cwd -and
+        [string]$script:Limits.Cwd -match '^[A-Za-z]:\\' -and
         (Test-Path -LiteralPath $script:Limits.Cwd)) { return [string]$script:Limits.Cwd }
     [string]$script:Config.ProjectPath
 }
 
+# Parsed facts per session file, reused while the file's live length (read
+# from an open handle; the directory entry can be stale) and a hash of its last
+# 4 KB are unchanged. Only derived values are kept, never transcript text.
+$script:SessionCache = @{}
+function Get-SessionSummary($f) {
+    $share = [IO.FileShare]'ReadWrite, Delete'
+    $fs = [IO.File]::Open($f.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    try {
+        $len = $fs.Length
+        $n = [int][Math]::Min([long]4096, $len)
+        [void]$fs.Seek($len - $n, [IO.SeekOrigin]::Begin)
+        $buf = New-Object byte[] $n
+        $got = 0
+        while ($got -lt $n) { $r = $fs.Read($buf, $got, $n - $got); if ($r -le 0) { break }; $got += $r }
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $key = '{0}:{1}' -f $len, [Convert]::ToBase64String($sha.ComputeHash($buf, 0, $got)) } finally { $sha.Dispose() }
+    } finally { $fs.Dispose() }
+    $hit = $script:SessionCache[$f.FullName]
+    if ($hit -and $hit.Key -eq $key) { return $hit }
+
+    $lines = Read-Tail $f.FullName
+    $rate = $null
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        if ($lines[$i] -notmatch '"rate_limits"') { continue }
+        try { $o = $lines[$i] | ConvertFrom-Json } catch { continue }
+        $rl = $null
+        foreach ($c in @($o.payload.rate_limits, $o.payload.info.rate_limits, $o.rate_limits, $o.msg.rate_limits)) {
+            if ($c) { $rl = $c; break }
+        }
+        if (-not $rl) { continue }
+        $t = Get-EventTime $o $f.LastWriteTime
+        $p = Convert-Window $rl.primary $t
+        $s = Convert-Window $rl.secondary $t
+        if (-not $p -and -not $s) { continue }
+        $rate = [pscustomobject]@{ Primary = $p; Secondary = $s; Plan = $rl.plan_type; Credits = $rl.credits; EventTime = $t }
+        break
+    }
+    $limitTimes = @(foreach ($line in $lines) {
+        if ($line -notmatch $LimitPattern) { continue }
+        try { Get-EventTime ($line | ConvertFrom-Json) $f.LastWriteTime } catch { $f.LastWriteTime }
+    })
+    $sum = [pscustomobject]@{
+        Key        = $key
+        Rate       = $rate
+        LimitTimes = $limitTimes
+        Cwd        = $(if ($rate) { Get-SessionCwd $f.FullName $lines })
+    }
+    $script:SessionCache[$f.FullName] = $sum
+    $sum
+}
+
 function Get-RateLimits {
     if (-not (Test-Path -LiteralPath $SessionsPath)) { return $null }
-    $files = Get-ChildItem -LiteralPath $SessionsPath -Recurse -Filter '*.jsonl' -File -ErrorAction SilentlyContinue |
-             Sort-Object LastWriteTime -Descending | Select-Object -First 5
+    $files = Get-SessionFiles
+    $best = $null; $bestFile = $null; $seen = @{}
+    # Events dated in the future are not trusted; they would outrank real data forever.
+    $latest = (Get-Date).AddMinutes(5)
     foreach ($f in $files) {
-        $lines = Read-Tail $f.FullName
-        for ($i = $lines.Count - 1; $i -ge 0; $i--) {
-            if ($lines[$i] -notmatch '"rate_limits"') { continue }
-            try { $o = $lines[$i] | ConvertFrom-Json } catch { continue }
-            $rl = $null
-            foreach ($c in @($o.payload.rate_limits, $o.payload.info.rate_limits, $o.rate_limits, $o.msg.rate_limits)) {
-                if ($c) { $rl = $c; break }
-            }
-            if (-not $rl) { continue }
-            $t = Get-EventTime $o $f.LastWriteTime
-            $p = Convert-Window $rl.primary $t
-            $s = Convert-Window $rl.secondary $t
-            if (-not $p -and -not $s) { continue }
-            return [pscustomobject]@{
-                Primary    = $p
-                Secondary  = $s
-                Plan       = $rl.plan_type
-                Credits    = $rl.credits
-                EventTime  = $t
-                Source     = $f.FullName
-                LimitHitAt = (Find-LimitError $files $t)
-                Cwd        = (Get-SessionCwd $f.FullName $lines)
-                SessionId  = (Get-SessionId $f.FullName)
-            }
-        }
+        $seen[$f.FullName] = $true
+        # A file can vanish or be locked between listing and reading; skip it.
+        try { $sum = Get-SessionSummary $f } catch { continue }
+        if (-not $sum.Rate -or $sum.Rate.EventTime -gt $latest) { continue }
+        if (-not $best -or $sum.Rate.EventTime -gt $best.Rate.EventTime) { $best = $sum; $bestFile = $f }
     }
-    $null
+    foreach ($k in @($script:SessionCache.Keys)) { if (-not $seen[$k]) { $script:SessionCache.Remove($k) } }
+    if (-not $best) { return $null }
+    $r = $best.Rate
+    [pscustomobject]@{
+        Primary    = $r.Primary
+        Secondary  = $r.Secondary
+        Plan       = $r.Plan
+        Credits    = $r.Credits
+        EventTime  = $r.EventTime
+        Source     = $bestFile.FullName
+        LimitHitAt = (Find-LimitError $files $r.EventTime)
+        Cwd        = $best.Cwd
+        SessionId  = (Get-SessionId $bestFile.FullName)
+    }
 }
 
 # A window is blocking when it reaches the threshold. If both are, wait for the
@@ -540,6 +771,19 @@ function Get-BlockingReset($l) {
     ($b | Sort-Object ResetAt -Descending | Select-Object -First 1).ResetAt
 }
 
+# Coarse age for the status line, so it does not change every second.
+function Format-Age([TimeSpan]$t) {
+    if ($t.TotalMinutes -lt 1) { return 'just now' }
+    if ($t.TotalHours -lt 1) { return '{0}m ago' -f [int][Math]::Floor($t.TotalMinutes) }
+    if ($t.Days -gt 0) { return '{0}d {1}h ago' -f $t.Days, $t.Hours }
+    '{0}h {1:00}m ago' -f $t.Hours, $t.Minutes
+}
+function Test-Stale($l) {
+    $m = 0.0; [void][double]::TryParse([string]$script:Config.StaleMinutes, [ref]$m)
+    if ($m -le 0) { $m = 30 }
+    $l -and ((Get-Date) - $l.EventTime).TotalMinutes -gt $m
+}
+
 function Format-Span([TimeSpan]$t) {
     if ($t.TotalSeconds -le 0) { return 'now' }
     if ($t.Days -gt 0) { return '{0}d {1}h {2:00}m' -f $t.Days, $t.Hours, $t.Minutes }
@@ -550,8 +794,19 @@ function Get-CommandTemplate {
     if ([string]$script:Config.ContinueMode -eq 'Background') { [string]$script:Config.BackgroundTemplate }
     else { [string]$script:Config.InteractiveTemplate }
 }
+# The id can come from inside a session file, so only a plain UUID is used.
 function Get-SessionArg {
-    if ($script:Limits -and $script:Limits.SessionId) { [string]$script:Limits.SessionId } else { '--last' }
+    $id = if ($script:Limits) { [string]$script:Limits.SessionId } else { '' }
+    if ($id -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { $id } else { '--last' }
+}
+# Splits a command template into words (double or single quotes group words)
+# and fills in {session} and {prompt} per word, so a value can never add
+# arguments or code.
+function Split-Template([string]$template, [string]$session, [string]$prompt) {
+    foreach ($m in [regex]::Matches($template, '"([^"]*)"|''([^'']*)''|(\S+)')) {
+        $w = ($m.Groups[1..3] | Where-Object Success | Select-Object -First 1).Value
+        $w.Replace('{session}', $session).Replace('{prompt}', $prompt)
+    }
 }
 function Get-ResumeCommand {
     if ([string]$script:Config.ContinueMode -eq 'Type') {
@@ -596,9 +851,10 @@ function Start-Resume([string]$reason) {
         $procId = [int]$sel.Target.ProcessId
         if (Send-ToCodex $procId ([string]$cfg.Prompt)) {
             $script:LastResume = Get-Date
+            $script:LastResumeWhat = 'Typed your prompt into the Codex window'
             if ($reason -ne 'manual') { $script:ContinuesSent++ }
-            Write-Log "Typed '$($cfg.Prompt)' into Codex (pid $procId) ($reason)"
-            Show-Tip 'Codex continued' "Typed '$($cfg.Prompt)' into your Codex window." 'Info'
+            Write-Log "Typed the prompt ($(([string]$cfg.Prompt).Length) characters) into Codex (pid $procId) ($reason)"
+            Show-Tip 'Codex continued' 'Typed your prompt into the Codex window.' 'Info'
         } else {
             Write-Log "Typing into Codex failed (pid $procId, exit $($script:TypeExit))"
             $why = switch ($script:TypeExit) {
@@ -615,9 +871,9 @@ function Start-Resume([string]$reason) {
     }
     $dir = Get-ResumeFolder
     if (-not (Test-Path -LiteralPath $dir)) {
-        Write-Log "Resume skipped ($reason): folder not found: $dir"
+        Write-Log "Resume skipped ($reason): project folder '$(Get-Leaf $dir)' not found"
         Set-Notice "Could not continue: project folder not found ($dir). Choose a folder with Browse."
-        Show-Tip 'Codex Resume' "Project folder not found: $dir" 'Error'
+        Show-Tip 'Codex Resume' 'Project folder not found. Choose one with Browse.' 'Error'
         return
     }
     $codex = Resolve-Codex
@@ -650,35 +906,77 @@ function Start-Resume([string]$reason) {
         try {
             Stop-Process -Id $open[0].ProcessId -ErrorAction Stop
             Wait-Process -Id $open[0].ProcessId -Timeout 10 -ErrorAction SilentlyContinue
-        } catch { }
+        } catch {
+            Write-Log "Resume skipped ($reason): could not close Codex (pid $($open[0].ProcessId)): $($_.Exception.Message)"
+            Set-Notice 'Could not continue: the open Codex could not be closed. Close it yourself, then press Continue now.'
+            Show-Tip 'Codex Resume' 'Could not close the open Codex.' 'Warning'
+            return
+        }
         Start-Sleep -Seconds 2   # let it release the session lock
     }
 
-    # Run the exact executable found, so PATH differences cannot break it.
-    $cmd = (Get-CommandTemplate).Replace('{session}', (Get-SessionArg)).Replace('{prompt}', '$prompt')
-    $cmd = $cmd -replace '^\s*codex(\.cmd|\.exe)?(?=\s|$)', '& $$codex'
+    # Run the exact executable found, so PATH differences cannot break it. The
+    # runner script is fixed text; folder, program and arguments travel in a
+    # data file it reads and deletes, so no value is ever run as code.
+    $words = @(Split-Template (Get-CommandTemplate) (Get-SessionArg) ([string]$cfg.Prompt))
+    if ($words.Count -eq 0) {
+        Set-Notice 'Could not continue: the command template in config.json is empty.'
+        return
+    }
+    $program = $words[0]
+    $argv = @($words | Select-Object -Skip 1)
+    if ($program -match '^codex(\.cmd|\.exe)?$') {
+        $launch = Get-CodexLaunch $codex
+        $program = $launch.Program
+        $argv = @($launch.Prefix) + $argv
+    }
+    # A .cmd or .bat still goes through cmd.exe; refuse what cmd.exe would reinterpret.
+    if ($program -match '\.(cmd|bat)$' -and @($argv -match "[`"%^&|<>!`r`n]").Count -gt 0) {
+        Write-Log "Resume skipped ($reason): prompt or template has characters cmd.exe would change"
+        Set-Notice 'Could not continue: Codex runs through cmd.exe here, which would change " % ^ & | < > ! and line breaks in your prompt. Remove them, or pick codex.exe with Browse.'
+        return
+    }
+    # A bare program name would be searched for in the project folder first;
+    # resolve it from PATH now instead.
+    if (-not [IO.Path]::IsPathRooted($program)) {
+        $found = Get-Command $program -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $found) {
+            Write-Log "Resume skipped ($reason): program in the command template not found"
+            Set-Notice "Could not continue: '$program' from the command template was not found."
+            return
+        }
+        $program = $found.Source
+    }
     $runner = Join-Path $ConfigDir 'run-resume.ps1'
-    $safeDir = $dir -replace "'", "''"
-    $safeCodex = $codex -replace "'", "''"
-    $body = @"
-`$Host.UI.RawUI.WindowTitle = 'Codex Resume'
-`$env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
-Set-Location -LiteralPath '$safeDir'
-`$codex = '$safeCodex'
-`$prompt = @'
-$($cfg.Prompt)
+    $data = Join-Path $ConfigDir 'run-resume.json'
+    $body = @'
+param([string]$DataPath)
+$d = Get-Content -LiteralPath $DataPath -Raw -Encoding UTF8 | ConvertFrom-Json
+Remove-Item -LiteralPath $DataPath -ErrorAction SilentlyContinue
+$Host.UI.RawUI.WindowTitle = 'Codex Resume'
+$env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+Set-Location -LiteralPath $d.Dir
+Write-Host "Resuming Codex in $PWD ..." -ForegroundColor Cyan
+Write-Host "Using $($d.Program)" -ForegroundColor DarkGray
+# Quote each argument by the Windows rules, so it arrives exactly as written
+# (Windows PowerShell 5.1 does not escape quotes inside arguments itself).
+$line = (@($d.Args) | ForEach-Object { '"' + (([string]$_ -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"' }) -join ' '
+$psi = New-Object Diagnostics.ProcessStartInfo ([string]$d.Program), $line
+$psi.UseShellExecute = $false
+$psi.WorkingDirectory = $d.Dir
+$p = [Diagnostics.Process]::Start($psi)
+$p.WaitForExit()
 '@
-Write-Host "Resuming Codex in `$PWD ..." -ForegroundColor Cyan
-Write-Host "Using `$codex" -ForegroundColor DarkGray
-$cmd
-"@
     Set-Content -LiteralPath $runner -Value $body -Encoding UTF8
-    Start-Process powershell.exe -WorkingDirectory $dir -ArgumentList @(
-        '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', "`"$runner`"")
+    ConvertTo-Json -InputObject @{ Dir = $dir; Program = $program; Args = [object[]]$argv } |
+        Set-Content -LiteralPath $data -Encoding UTF8
+    Start-Process $WinPowerShell -WorkingDirectory $dir -ArgumentList @(
+        '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', "`"$runner`"", '-DataPath', "`"$data`"")
     $script:LastResume = Get-Date
+    $script:LastResumeWhat = 'Resumed your last session in a new window'
     if ($reason -ne 'manual') { $script:ContinuesSent++ }
-    Write-Log "Resumed ($reason) in $dir :: $cmd"
-    Show-Tip 'Codex resumed' "Sent '$($cfg.Prompt)' to your last session." 'Info'
+    Write-Log "Resumed ($reason) in folder '$(Get-Leaf $dir)', mode $($cfg.ContinueMode)"
+    Show-Tip 'Codex resumed' 'Sent your prompt to your last session.' 'Info'
 }
 
 function Use-ResetCredit([string]$reason) {
@@ -686,15 +984,34 @@ function Use-ResetCredit([string]$reason) {
     $script:ResetTriedFor = $script:ArmedFor
     $cmd = [string]$cfg.UseResetCommand
     if ($cmd.Trim()) {
-        Write-Log "Using reset credit ($reason): $cmd"
-        $script:ResetProc = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList @(
-            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $cmd)
+        # The command may hold a token, so it is never logged and never put on a
+        # command line: it runs from a script in the user-only settings folder,
+        # deleted when it finishes. The last line keeps -Command's exit rule
+        # (1 when the last command failed).
+        Write-Log "Using reset credit ($reason) with your reset command"
+        $script:ResetScript = Join-Path $ConfigDir 'reset-command.ps1'
+        # The blank line ends a command that finishes with a ` line continuation.
+        Set-Content -LiteralPath $script:ResetScript -Value "$cmd`r`n`r`nif (-not `$?) { exit 1 }" -Encoding UTF8
+        $script:ResetProc = Start-Process $WinPowerShell -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:ResetScript)`"")
         Show-Tip 'Codex Resume' 'Using a reset credit...' 'Info'
     } else {
-        Write-Log "Opened usage page to redeem a reset ($reason)"
-        Start-Process ([string]$cfg.UsagePageUrl)
+        $u = $null
+        if (-not ([Uri]::TryCreate([string]$cfg.UsagePageUrl, [UriKind]::Absolute, [ref]$u) -and $u.Scheme -eq 'https')) {
+            Write-Log "Reset not started ($reason): UsagePageUrl is not an https address"
+            Set-Notice 'UsagePageUrl in config.json must be an https:// address.'
+            return
+        }
         $script:AwaitingManualReset = $true
-        Show-Tip 'Use your reset' 'Click "Use reset" on the Usage page, then press Continue now.' 'Info'
+        if ($reason -eq 'manual') {
+            Write-Log 'Opened the Usage page to redeem a reset'
+            Start-Process $u.AbsoluteUri
+            Show-Tip 'Use your reset' 'Click "Use reset" on the Usage page, then press Continue now.' 'Info'
+        } else {
+            # Unattended: never open the browser on its own; ask instead.
+            Write-Log "A reset credit could shorten the wait ($reason); asked you to redeem it"
+            Show-Tip 'Use a reset?' 'The wait is long. Press "Use reset" in Codex Resume to open the Usage page.' 'Info'
+        }
         Show-Main
     }
 }
@@ -704,6 +1021,7 @@ function Check-Reset {
     $p = $script:ResetProc
     if ($p -and $p.HasExited) {
         $script:ResetProc = $null
+        if ($script:ResetScript) { Remove-Item -LiteralPath $script:ResetScript -ErrorAction SilentlyContinue }
         if ($p.ExitCode -eq 0) {
             Write-Log 'Reset credit used'
             Consume-Reset
@@ -742,7 +1060,12 @@ function Set-Notice([string]$text) { $script:Notice = $text; $script:NoticeUntil
 $script:CodexExe = $null
 function Refresh-Limits {
     $script:LastRefresh = Get-Date
-    try { if ($cmbTarget) { Update-TargetList } } catch { }
+    # The runner deletes its data file at once; one still here after 2 minutes was never read.
+    $rj = Join-Path $ConfigDir 'run-resume.json'
+    if ((Test-Path -LiteralPath $rj) -and ((Get-Date) - (Get-Item -LiteralPath $rj).LastWriteTime).TotalMinutes -gt 2) {
+        Remove-Item -LiteralPath $rj -ErrorAction SilentlyContinue
+    }
+    try { if ($cmbTarget) { Update-CodexScan; Update-TargetList } } catch { }
     try { $script:CodexExe = Resolve-Codex } catch { $script:CodexExe = $null }
     try {
         $script:Limits = Get-RateLimits
@@ -759,6 +1082,33 @@ function Refresh-Limits {
     }
     $flags = if ($script:ArmedFor -and $script:Config.AutoResume -and $script:Config.KeepAwake) { $ES_KEEP_AWAKE } else { $ES_CONTINUOUS }
     [void][CodexResume.Power]::SetThreadExecutionState($flags)
+    $script:Warnings = @(Get-Warnings)
+    $script:FirstScanDone = $true
+}
+
+# Problems that stay on screen until they are fixed (a notice fades after 10
+# minutes; these do not).
+$script:Warnings = @()
+$script:AclCache = @{}
+function Get-OthersCanWriteCached([string]$path) {
+    $c = $script:AclCache[$path]
+    if ($c -and ((Get-Date) - $c.At).TotalMinutes -lt 10) { return $c.Value }
+    $v = Test-OthersCanWrite $path
+    $script:AclCache[$path] = @{ Value = $v; At = Get-Date }
+    $v
+}
+function Get-Warnings {
+    if ($script:ConfigError) { $script:ConfigError }
+    if ([string]$script:Config.ContinueMode -ne 'Type' -and -not $script:CodexExe) {
+        'Codex CLI not found, so a new window cannot be opened. Use Browse next to Codex CLI.'
+    }
+    # Paths are listed under Details (Sessions folder, Codex CLI).
+    if ((Test-Path -LiteralPath $SessionsPath) -and (Get-OthersCanWriteCached $SessionsPath)) {
+        'Other accounts on this PC may be able to write to the Codex sessions folder and fake usage data. Limit it to your account.'
+    }
+    if ($script:CodexExe -and (Get-OthersCanWriteCached (Split-Path $script:CodexExe))) {
+        'Other accounts on this PC may be able to change the folder the Codex CLI runs from.'
+    }
 }
 
 # ---------------------------------------------------------------- theme ------
@@ -843,6 +1193,9 @@ $form.StartPosition   = 'CenterScreen'
 $form.TopMost         = [bool]$script:Config.AlwaysOnTop
 $form.Font            = New-Object Drawing.Font('Segoe UI', (9 * $Z))
 $form.KeyPreview      = $true
+# At large text sizes the window can be taller than the screen; scroll instead
+# of pushing controls out of reach.
+$form.AutoScroll      = $true
 
 $script:TabN = 0
 function Add-Ctl([string]$type, [hashtable]$props, $parent = $form) {
@@ -870,8 +1223,11 @@ $pctW   = Add-Ctl Label @{ Location = (Pt 425 60); Size = (Sz 163 18) }
 $infoW  = Add-Ctl Label @{ Location = (Pt 12 80); Size = (Sz 576 18); Tag = 'muted' }
 
 # Two lines tall so longer messages wrap instead of being cut off.
+# Text that does not fit ends in "..."; the full text is in its tooltip and in Details > Access.
 $status = Add-Ctl Label @{ Location = (Pt 12 106); Size = (Sz 576 36); Font = $bold; Tag = 'status'
-                           AccessibleName = 'Status'; AccessibleRole = 'StatusBar'; UseMnemonic = $false }
+                           AccessibleName = 'Status'; UseMnemonic = $false; AutoEllipsis = $true }
+# Screen readers announce changes of state (not every countdown second); see Update-UI.
+try { $status.LiveSetting = 'Polite' } catch { }
 
 $chkAuto = Add-Ctl CheckBox @{ Text = '&Auto-continue when the limit resets'; Location = (Pt 12 146); Size = (Sz 400 22)
                                Checked = [bool]$script:Config.AutoResume }
@@ -893,6 +1249,8 @@ $dtExp = Add-Ctl DateTimePicker @{ Location = (Pt 260 196); Size = (Sz 150 22); 
 $expInit = Get-ResetExpiry
 if ($expInit) { $dtExp.Value = $expInit; $dtExp.Checked = $true } else { $dtExp.Checked = $false }
 $tips.SetToolTip($numHave, 'Codex logs do not report banked resets. Enter your count from Settings > Usage.')
+[void](Add-Ctl Label @{ Text = 'Codex logs do not report these; copy them from Settings > Usage.'; Location = (Pt 416 193)
+                        Size = (Sz 172 30); Tag = 'muted'; UseMnemonic = $false; Font = New-Object Drawing.Font('Segoe UI', (8 * $Z)) })
 
 [void](Add-Ctl Label @{ Text = 'F&older'; Location = (Pt 12 233); Size = (Sz 48 18) })
 $txtDir  = Add-Ctl TextBox @{ Location = (Pt 62 230); Size = (Sz 460 22); ReadOnly = $true; Text = [string]$script:Config.ProjectPath
@@ -926,14 +1284,37 @@ $cmbTarget = Add-Ctl ComboBox @{ Location = (Pt 344 351); Size = (Sz 244 24); Dr
                                  AccessibleName = 'Codex window to type into'; DropDownWidth = (S 420) }
 $tips.SetToolTip($cmbTarget, 'Which open Codex window to type into. Only needed when more than one is open.')
 $script:TargetIds = @()
+$script:TargetStarts = @()
 
 # Fills the Target list. Leaves it alone while it is open or nothing changed.
+# The process scan takes about a second (two WMI queries), so the regular
+# refresh runs it in a background runspace and uses the last finished result;
+# the window never freezes for it. A resume still scans directly, so it acts
+# on current data.
+$script:ScanPS = $null; $script:ScanHandle = $null; $script:OpenCodex = @()
+# Takes the finished scan's result. Returns $true when a new one arrived.
+function Receive-CodexScan {
+    if (-not ($script:ScanHandle -and $script:ScanHandle.IsCompleted)) { return $false }
+    try { $script:OpenCodex = @($script:ScanPS.EndInvoke($script:ScanHandle)) } catch { }
+    $script:ScanPS.Dispose(); $script:ScanPS = $null; $script:ScanHandle = $null
+    $true
+}
+# Starts a scan unless one is still running.
+function Update-CodexScan {
+    [void](Receive-CodexScan)
+    if ($script:ScanHandle) { return }
+    $src ="function Get-CodexSubcommand {${function:Get-CodexSubcommand}}`nfunction Get-OpenCodex {${function:Get-OpenCodex}}`n" +
+           '$NonTuiCommands = $args[0]; Get-OpenCodex'
+    $script:ScanPS = [powershell]::Create().AddScript($src).AddArgument($NonTuiCommands)
+    $script:ScanHandle = $script:ScanPS.BeginInvoke()
+}
 function Update-TargetList {
     if ($cmbTarget.DroppedDown) { return }
-    $open = @(Get-OpenCodex)
+    $open = @($script:OpenCodex)
     $ids = @($open | ForEach-Object { $_.ProcessId })
     if (($ids -join ',') -eq ($script:TargetIds -join ',') -and $cmbTarget.Items.Count -gt 0) { return }
     $script:TargetIds = $ids
+    $script:TargetStarts = @($open | ForEach-Object { Format-StartKey $_.Started })
     $script:FillingTargets = $true
     $cmbTarget.Items.Clear()
     if ($open.Count -eq 0) { [void]$cmbTarget.Items.Add('No Codex window open') }
@@ -984,7 +1365,9 @@ $tips.SetToolTip($cmbUpd, 'How often the countdowns redraw. Auto-continue keeps 
 # ---- Details panel ----
 # Values are borderless read-only text boxes: they wrap long paths onto extra
 # lines, can be reached with Tab, read by screen readers, and copied.
-$grp = Add-Ctl GroupBox @{ Text = 'Details'; Location = (Pt 12 460); Size = (Sz 576 300) }
+# No AccessibleName: screen readers read the text, which says Show or Hide.
+$btnDetails = Add-Ctl Button @{ Location = (Pt 12 458); Size = (Sz 120 28) }
+$grp = Add-Ctl GroupBox @{ Text = 'Details'; Location = (Pt 12 492); Size = (Sz 576 300) }
 $CapW   = 120
 $ValX   = 136
 $ValW   = 576 - $ValX - 12
@@ -998,23 +1381,25 @@ function Add-Detail([string]$key, [string]$caption, [switch]$IsPath) {
     $val = Add-Ctl TextBox @{ Location = (Pt $ValX 0); Size = (Sz $w 18); ReadOnly = $true; Multiline = $true
                              WordWrap = $true; BorderStyle = 'None'; TabStop = $true; Tag = 'detail'
                              AccessibleName = $caption } $grp
-    $val.Add_GotFocus({ param($s, $e) $s.BackColor = $script:Pal.Focus; $s.ForeColor = $script:Pal.FocusFore })
+    # Focus shows as a fill plus a border, so it is visible even where the fill is faint.
+    $val.Add_GotFocus({ param($s, $e) $s.BackColor = $script:Pal.Focus; $s.ForeColor = $script:Pal.FocusFore; $s.BorderStyle = 'FixedSingle' })
     $val.Add_LostFocus({
         param($s, $e)
         $s.BackColor = $script:Pal.Back
+        $s.BorderStyle = 'None'
         foreach ($r in $script:DetailRows.Values) { if ($r.Value -eq $s) { $s.ForeColor = $script:Pal[$r.ColorKey] } }
     })
     $open = $null
     if ($IsPath) {
-        $open = Add-Ctl LinkLabel @{ Text = 'Open'; Location = (Pt ($ValX + $PathW + 8) 0); Size = (Sz 44 18)
+        $open = Add-Ctl LinkLabel @{ Text = 'Open'; Location = (Pt ($ValX + $PathW + 8) 0); Size = (Sz 44 24)
                                      AccessibleName = "Open $caption in Explorer"; UseMnemonic = $false } $grp
         $open.Tag = $val
         $open.Add_LinkClicked({
             param($sender, $e)
             $p = [string]$sender.Tag.Text
             if (-not $p -or $p -like '(*') { return }
-            if (Test-Path -LiteralPath $p -PathType Leaf) { Start-Process explorer.exe "/select,`"$p`"" }
-            elseif (Test-Path -LiteralPath $p) { Start-Process explorer.exe "`"$p`"" }
+            if (Test-Path -LiteralPath $p -PathType Leaf) { Start-Process (Join-Path $env:SystemRoot 'explorer.exe') "/select,`"$p`"" }
+            elseif (Test-Path -LiteralPath $p) { Start-Process (Join-Path $env:SystemRoot 'explorer.exe') "`"$p`"" }
             else { Set-Notice "Not found: $p"; Update-UI }
         })
         $tips.SetToolTip($open, 'Open in Explorer')
@@ -1023,21 +1408,37 @@ function Add-Detail([string]$key, [string]$caption, [switch]$IsPath) {
 }
 
 function Layout-Details {
-    $y = S 24
-    foreach ($r in $script:DetailRows.Values) {
-        $t = if ($r.Value.Text) { $r.Value.Text } else { ' ' }
-        $m = [Windows.Forms.TextRenderer]::MeasureText($t, $r.Value.Font, (New-Object Drawing.Size($r.Value.Width, 0)), $script:DetailFlags)
-        $h = [Math]::Max((S 18), $m.Height + 2)
-        if ($r.Caption.Top -ne $y) { $r.Caption.Top = $y }
-        if ($r.Value.Top -ne $y)   { $r.Value.Top = $y }
-        if ($r.Value.Height -ne $h) { $r.Value.Height = $h }
-        if ($r.Open -and $r.Open.Top -ne $y) { $r.Open.Top = $y }
-        $y += $h + (S 4)
-    }
-    $gh = $y + (S 6)
-    if ($grp.Height -ne $gh) { $grp.Height = $gh }
-    $cs = New-Object Drawing.Size((S $W), ($grp.Bottom + (S 12)))
+    $show = [bool]$script:Config.DetailsOpen
+    [void](Set-Text $btnDetails $(if ($show) { 'Hide details' } else { 'Show details' }))
+    $grp.Visible = $show
+    if ($show) {
+        $y = S 24
+        foreach ($r in $script:DetailRows.Values) {
+            $t = if ($r.Value.Text) { $r.Value.Text } else { ' ' }
+            # The text box wraps a little inside its edges (and inside the focus border), so measure narrower.
+            $m = [Windows.Forms.TextRenderer]::MeasureText($t, $r.Value.Font, (New-Object Drawing.Size(($r.Value.Width - (S 8)), 0)), $script:DetailFlags)
+            # Rows are at least 24 units tall so the Open links are easy to hit.
+            $h = [Math]::Max((S 24), $m.Height + 4)
+            if ($r.Caption.Top -ne $y) { $r.Caption.Top = $y }
+            if ($r.Value.Top -ne $y)   { $r.Value.Top = $y }
+            if ($r.Value.Height -ne $h) { $r.Value.Height = $h }
+            if ($r.Open -and $r.Open.Top -ne $y) { $r.Open.Top = $y }
+            $y += $h + (S 2)
+        }
+        $gh = $y + (S 6)
+        if ($grp.Height -ne $gh) { $grp.Height = $gh }
+        $bottom = $grp.Bottom
+    } else { $bottom = $btnDetails.Bottom }
+    # Content height, but never taller than the screen: the rest scrolls.
+    $content = New-Object Drawing.Size((S $W), ($bottom + (S 12)))
+    $form.AutoScrollMinSize = $content
+    $maxH = [Windows.Forms.Screen]::FromControl($form).WorkingArea.Height - ($form.Height - $form.ClientSize.Height) - 8
+    $cs = New-Object Drawing.Size(($content.Width + $(if ($content.Height -gt $maxH) { [Windows.Forms.SystemInformation]::VerticalScrollBarWidth } else { 0 })),
+                                  [Math]::Min($content.Height, $maxH))
     if ($form.ClientSize -ne $cs) { $form.ClientSize = $cs }
+    # Keep the whole window on the screen it is on after it grows.
+    $wa = [Windows.Forms.Screen]::FromControl($form).WorkingArea
+    if ($form.Bottom -gt $wa.Bottom) { $form.Top = [Math]::Max($wa.Top, $wa.Bottom - $form.Height) }
 }
 
 $script:DetailsDirty = $true
@@ -1051,12 +1452,13 @@ function Set-Detail([string]$key, [string]$text, [string]$colorKey = 'Fore') {
 }
 
 Add-Detail 'access'   'Access'
+Add-Detail 'warnings' 'Warnings'
 Add-Detail 'trigger'  'Arms when'
 Add-Detail 'plan'     'Plan'
 Add-Detail 'resets'   'Reset credits'
 Add-Detail 'credits'  'Paid credits'
 Add-Detail 'updated'  'Last usage update'
-Add-Detail 'refresh'  'Last file check'
+Add-Detail 'refresh'  'Logs last scanned'
 Add-Detail 'resume'   'Last resume'
 Add-Detail 'command'  'Resume command'
 Add-Detail 'home'     'Codex home'      -IsPath
@@ -1146,7 +1548,7 @@ function Apply-Theme {
 }
 
 # Visible keyboard focus on flat (dark mode) buttons: a thicker accent border.
-foreach ($b in @($btnDir, $btnCodex, $btnNow, $btnReset, $btnRef, $btnLog)) {
+foreach ($b in @($btnDir, $btnCodex, $btnNow, $btnReset, $btnRef, $btnLog, $btnDetails)) {
     $b.Add_GotFocus({ param($s, $e) $s.FlatAppearance.BorderSize = 2; $s.FlatAppearance.BorderColor = $script:Pal.Link })
     $b.Add_LostFocus({ param($s, $e) $s.FlatAppearance.BorderSize = 1; $s.FlatAppearance.BorderColor = $script:Pal.Border })
 }
@@ -1159,7 +1561,7 @@ $tray.Visible = $true
 $menu = New-Object Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add('&Show', $null, { Show-Main })
 [void]$menu.Items.Add('&Continue now', $null, { Start-Resume 'manual' })
-[void]$menu.Items.Add('E&xit', $null, { $form.Close() })
+[void]$menu.Items.Add('E&xit', $null, { $script:ReallyExit = $true; $form.Close() })
 $tray.ContextMenuStrip = $menu
 $tray.Add_DoubleClick({ Show-Main })
 
@@ -1168,7 +1570,9 @@ function Show-Tip([string]$title, [string]$text, [string]$icon = 'Info') {
     $tray.ShowBalloonTip(5000, $title, $text, [Windows.Forms.ToolTipIcon]$icon)
 }
 
-function Set-Row($bar, $pct, $info, $w) {
+# $asOf is set when the numbers are old or could not be re-read, so each bar
+# says how current it is.
+function Set-Row($bar, $pct, $info, $w, $asOf) {
     if (-not $w) {
         $bar.Value = 0; [void](Set-Text $pct 'no data'); [void](Set-Text $info '')
         $bar.AccessibleDescription = 'No data yet'
@@ -1180,10 +1584,14 @@ function Set-Row($bar, $pct, $info, $w) {
     if ($refreshed) { $used = 0 }
     $left = [int][Math]::Max(0, [Math]::Min(100, [Math]::Round(100 - $used)))
     $bar.Value = $left
-    [void](Set-Text $pct ("$left% left ({0:0}% used)" -f $used))
-    if (-not $w.ResetAt) { [void](Set-Text $info '') }
-    elseif ($refreshed) { [void](Set-Text $info ('Reset at {0:ddd MMM d, h:mm tt}, window has refreshed' -f $w.ResetAt)) }
-    else { [void](Set-Text $info ('Resets {0:ddd MMM d, h:mm:ss tt}  (in {1})' -f $w.ResetAt, (Format-Span ($w.ResetAt - $now)))) }
+    # After a reset nothing has been logged yet, so the full bar is an estimate.
+    if ($refreshed) { [void](Set-Text $pct "about $left% left (estimate)") }
+    else { [void](Set-Text $pct ("$left% left ({0:0}% used)" -f $used)) }
+    $t = if (-not $w.ResetAt) { '' }
+         elseif ($refreshed) { 'Reset at {0:ddd h:mm tt}; usage since then not seen yet' -f $w.ResetAt }
+         else { 'Resets {0:ddd MMM d, h:mm:ss tt}  (in {1})' -f $w.ResetAt, (Format-Span ($w.ResetAt - $now)) }
+    if ($asOf) { $t = ('{0}  [as of {1:h:mm tt}]' -f $t, $asOf).TrimStart() }
+    [void](Set-Text $info $t)
     $bar.AccessibleDescription = "$($pct.Text). $($info.Text)"
 }
 
@@ -1191,32 +1599,84 @@ function Update-UI {
     $script:LastUIUpdate = Get-Date
     $l = $script:Limits
     $p = $script:Pal
-    Set-Row $bar5 $pct5 $info5 $(if ($l) { $l.Primary })
-    Set-Row $barW $pctW $infoW $(if ($l) { $l.Secondary })
     $now = Get-Date
+    # Codex writes usage only while it works; if a Codex window is open but
+    # nothing has been logged for 10 minutes, the numbers may be behind.
+    $silentOpen = $l -and @($script:TargetIds).Count -gt 0 -and ($now - $l.EventTime).TotalMinutes -gt 10
+    $stale = $l -and ((Test-Stale $l) -or $silentOpen)
+    $asOf = if ($l -and ($stale -or $script:ReadError)) { $l.EventTime } else { $null }
+    Set-Row $bar5 $pct5 $info5 $(if ($l) { $l.Primary }) $asOf
+    Set-Row $barW $pctW $infoW $(if ($l) { $l.Secondary }) $asOf
 
+    # Most urgent first. $state is a short, non-ticking summary used for the
+    # tray and for screen-reader announcements.
     $sKey = 'Green'
     if ($script:Notice -and $now -lt $script:NoticeUntil) {
-        $sKey = 'Red'; $sText = "Error: $($script:Notice)"
-    } elseif ($script:ReadError) {
-        $sKey = 'Red'; $sText = "Error reading Codex logs: $($script:ReadError)"
-    } elseif (-not $l) {
-        $sKey = 'Yellow'; $sText = 'Waiting for Codex usage data. Run Codex once.'
+        $sKey = 'Red'; $sText = "Error: $($script:Notice)"; $state = 'error'
     } elseif ($script:ArmedFor) {
+        # Stays on top of a read error, so the countdown is never hidden.
         $at = $script:ArmedFor.AddSeconds([double]$script:Config.BufferSeconds)
-        $sKey = 'Red'
+        $sKey = 'Red'; $state = 'rate limited'
         $sText = if ($script:Config.AutoResume) {
             'Rate limited. Continuing at {0:h:mm:ss tt} (in {1}).' -f $at, (Format-Span ($at - $now))
         } else { 'Rate limited. Auto-continue is off.' }
+        if ($script:ReadError) { $sText += ' Codex logs could not be read just now; see Details.' }
+    } elseif ($script:ReadError) {
+        $sKey = 'Red'; $sText = "Error reading Codex logs: $($script:ReadError). Showing the last values read."; $state = 'error'
+    } elseif (-not $script:FirstScanDone) {
+        $sKey = 'Yellow'; $sText = 'Reading Codex logs...'; $state = 'starting'
+    } elseif (-not $l) {
+        $sKey = 'Yellow'; $sText = 'Waiting for Codex usage data. Run Codex once.'; $state = 'no data'
     } else {
-        $sText = 'OK, not rate limited. Last usage update {0:h:mm tt}.' -f $l.EventTime
+        $age = Format-Age ($now - $l.EventTime)
+        if ($silentOpen) {
+            $sKey = 'Yellow'; $state = 'stale'
+            $sText = 'Stale data: Codex is open but has not logged usage since {0:h:mm tt} ({1}). Numbers may be behind.' -f $l.EventTime, $age
+        } elseif ($stale) {
+            $sKey = 'Yellow'; $state = 'stale'
+            $sText = 'Stale data: last usage update {0:h:mm tt} ({1}). Not rate limited as of then.' -f $l.EventTime, $age
+        } else {
+            $state = 'OK'
+            $sText = 'OK, not rate limited. Last usage update {0:h:mm tt} ({1}).' -f $l.EventTime, $age
+        }
+    }
+    # Warnings stay visible until fixed: on their own when all is otherwise
+    # well, or as a pointer next to a more urgent message.
+    $nWarn = @($script:Warnings).Count
+    if ($nWarn -gt 0) {
+        if ($state -in 'OK', 'no data') { $sKey = 'Yellow'; $sText = "Warning: $(@($script:Warnings)[0])"; $state = 'warning' }
+        elseif ($state -ne 'error') { $sText += " Also $nWarn warning(s); see Details." }
     }
     if ([string]$script:Config.DisplayUpdate -eq 'Paused') { $sText += ' Display paused; press Refresh to update.' }
     $status.ForeColor = $p[$sKey]
-    [void](Set-Text $status $sText)
+    if (Set-Text $status $sText) { $tips.SetToolTip($status, $sText) }
+    if ($state -ne $script:LastState) {
+        $script:LastState = $state
+        try { $status.AccessibilityObject.RaiseLiveRegionChanged() } catch { }
+    }
+
+    # Tray: lead with the state, since Windows cuts the tooltip at 63 characters.
+    # Same rule as the bars: after a reset the window counts as full (an estimate).
+    $pct = { param($w)
+        if (-not $w) { '?' }
+        elseif ($w.ResetAt -and $w.ResetAt -le $now) { '~100' }
+        else { [int][Math]::Round([Math]::Max(0, 100 - $w.Used)) } }
+    $tip = switch ($state) {
+        'rate limited' { if ($script:Config.AutoResume) { 'Codex: RATE LIMITED, continues {0:h:mm tt}' -f $at } else { 'Codex: RATE LIMITED, auto-continue off' } }
+        'error'        { 'Codex Resume: error, open for details' }
+        'warning'      { 'Codex Resume: warning, open for details' }
+        'starting'     { 'Codex Resume: reading logs...' }
+        'no data'      { 'Codex Resume: no usage data yet' }
+        'stale'        { 'Codex: {0}% 5h, {1}% wk left as of {2:h:mm tt}' -f (& $pct $l.Primary), (& $pct $l.Secondary), $l.EventTime }
+        default        { 'Codex: {0}% 5h, {1}% wk left' -f (& $pct $l.Primary), (& $pct $l.Secondary) }
+    }
+    $tray.Text = $tip.Substring(0, [Math]::Min(63, $tip.Length))
+    $icon = switch ($state) { { $_ -in 'rate limited', 'error' } { [Drawing.SystemIcons]::Error } { $_ -in 'warning', 'stale' } { [Drawing.SystemIcons]::Warning } default { [Drawing.SystemIcons]::Information } }
+    if ($tray.Icon -ne $icon) { $tray.Icon = $icon }
 
     # Details
     Set-Detail 'access' $sText $sKey
+    Set-Detail 'warnings' $(if (@($script:Warnings).Count) { @($script:Warnings) -join ' ' } else { 'none' }) $(if (@($script:Warnings).Count) { 'Yellow' } else { 'Fore' })
     $trig = 'a window reaches {0}% used, or Codex logs a usage-limit error' -f $script:Config.LimitThreshold
     if ($l -and $l.LimitHitAt) { $trig += '. Usage-limit error seen {0:ddd h:mm tt}.' -f $l.LimitHitAt }
     Set-Detail 'trigger' $trig
@@ -1239,11 +1699,16 @@ function Update-UI {
     }
     Set-Detail 'resets' $rtext $rKey
     Set-Detail 'credits' $(if ($l) { Format-Credits $l.Credits } else { 'unknown' })
-    Set-Detail 'updated' $(if ($l) { '{0:ddd MMM d, h:mm:ss tt}  ({1} ago)' -f $l.EventTime, (Format-Span ($now - $l.EventTime)) } else { 'never' })
-    Set-Detail 'refresh' ('{0:h:mm:ss tt}  (every {1}s)' -f $script:LastRefresh, $script:Config.RefreshSeconds)
+    if ($l) {
+        $upd = '{0:ddd MMM d, h:mm:ss tt}  ({1} ago)' -f $l.EventTime, (Format-Span ($now - $l.EventTime))
+        if ($stale) { $upd += '. Stale: Codex has not logged usage since then.' }
+        Set-Detail 'updated' $upd $(if ($stale) { 'Yellow' } else { 'Fore' })
+    } else { Set-Detail 'updated' 'never' }
+    Set-Detail 'refresh' ('{0:h:mm:ss tt}  (every {1}s; this is when the logs were checked, not how new the data is)' -f $script:LastRefresh, $script:Config.RefreshSeconds)
     $cnt = "$($script:ContinuesSent) automatic continue(s) this run"
     if ([int]$script:Config.MaxContinues -gt 0) { $cnt += " (limit $($script:Config.MaxContinues))" }
-    Set-Detail 'resume'  $(if ($script:LastResume) { '{0:ddd MMM d, h:mm:ss tt}. {1}' -f $script:LastResume, $cnt } else { "never. $cnt" })
+    $what = if ($script:LastResumeWhat) { " $($script:LastResumeWhat)." } else { '' }
+    Set-Detail 'resume'  $(if ($script:LastResume) { '{0:ddd MMM d, h:mm:ss tt}.{1} {2}' -f $script:LastResume, $what, $cnt } else { "never. $cnt" })
     Set-Detail 'command' (Get-ResumeCommand)
     Set-Detail 'home'     $CodexHome
     Set-Detail 'sessions' $SessionsPath
@@ -1262,13 +1727,11 @@ function Update-UI {
     # Keep the on-hand box in sync when the app uses a reset.
     $have = [decimal][Math]::Max(0, [int]$script:Config.ResetsOnHand)
     if ($numHave.Value -ne $have -and -not $numHave.Focused) { $script:SyncingHave = $true; $numHave.Value = $have; $script:SyncingHave = $false }
-
-    $tip = "Codex: $([Math]::Round($bar5.Value))% (5h), $([Math]::Round($barW.Value))% (wk) left"
-    $tray.Text = $tip.Substring(0, [Math]::Min(63, $tip.Length))
 }
 
 function Restart-App {
-    Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-STA',
+    $script:ReallyExit = $true
+    Start-Process $WinPowerShell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-STA',
         '-File', "`"$PSCommandPath`"")
     $form.Close()
 }
@@ -1308,8 +1771,9 @@ $cmbTarget.Add_SelectedIndexChanged({
     $i = $cmbTarget.SelectedIndex
     if ($script:TargetIds.Count -gt 1 -and $i -ge 1) {
         $script:Config.TargetPid = [int]$script:TargetIds[$i - 1]
+        $script:Config.TargetStarted = [string]$script:TargetStarts[$i - 1]
         $script:Notice = $null
-    } else { $script:Config.TargetPid = 0 }
+    } else { $script:Config.TargetPid = 0; $script:Config.TargetStarted = '' }
     Save-Config; Update-UI
 })
 $chkClose.Add_CheckedChanged({ $script:Config.CloseOpenCodex = $chkClose.Checked; Save-Config })
@@ -1350,9 +1814,36 @@ $btnNow.Add_Click({
 $btnReset.Add_Click({ Use-ResetCredit 'manual'; Update-UI })
 $chkReset.Add_CheckedChanged({ $script:Config.UseReset = $chkReset.Checked; Save-Config })
 $numReset.Add_ValueChanged({ $script:Config.ResetMinWaitMinutes = [int]$numReset.Value; Save-Config })
-$btnLog.Add_Click({ if (-not (Test-Path -LiteralPath $LogPath)) { Write-Log 'Log created' }; Start-Process notepad.exe $LogPath })
+$btnLog.Add_Click({ if (-not (Test-Path -LiteralPath $LogPath)) { Write-Log 'Log created' }; Start-Process (Join-Path $env:SystemRoot 'System32\notepad.exe') "`"$LogPath`"" })
 $btnRef.Add_Click({ Refresh-Limits; Update-UI })
-$form.Add_Resize({ if ($form.WindowState -eq 'Minimized') { $form.Hide(); Show-Tip 'Codex Resume' 'Still watching from the tray. Press Windows+B to reach the tray.' } })
+$btnDetails.Add_Click({ $script:Config.DetailsOpen = -not [bool]$script:Config.DetailsOpen; Save-Config; $script:DetailsDirty = $true; Update-UI })
+
+# Minimise and the X button both hide to the tray, so auto-continue keeps
+# working; Exit in the tray menu really quits. The tray hint shows once per run.
+function Hide-ToTray {
+    $form.Hide()
+    if (-not $script:TrayHintShown) {
+        $script:TrayHintShown = $true
+        Show-Tip 'Codex Resume' 'Still watching from the tray. Right-click the tray icon and choose Exit to quit.'
+    }
+}
+$form.Add_Resize({ if ($form.WindowState -eq 'Minimized') { Hide-ToTray } })
+# After the window is dragged (perhaps to a smaller screen), fit it again.
+$form.Add_ResizeEnd({ Layout-Details })
+$form.Add_FormClosing({
+    param($s, $e)
+    # None is a plain close message from another program (e.g. the taskbar); treat it like the X button.
+    if (-not $script:ReallyExit -and [string]$e.CloseReason -in 'UserClosing', 'None') { $e.Cancel = $true; Hide-ToTray }
+})
+# Esc hides to the tray, F5 re-reads the logs.
+$form.Add_KeyDown({
+    param($s, $e)
+    # Esc first closes any open list or calendar; only then does it hide the window.
+    $ac = $form.ActiveControl
+    $popup = ($ac -is [Windows.Forms.ComboBox] -and $ac.DroppedDown) -or $ac -is [Windows.Forms.DateTimePicker]
+    if ($e.KeyCode -eq 'Escape' -and -not $popup) { $e.Handled = $true; Hide-ToTray }
+    elseif ($e.KeyCode -eq 'F5') { $e.Handled = $true; Refresh-Limits; Update-UI }
+})
 
 $script:LastUIUpdate = [datetime]::MinValue
 $timer = New-Object Windows.Forms.Timer
@@ -1366,6 +1857,7 @@ $timer.Add_Tick({
             # Follow Windows if the theme is System, or High Contrast was toggled.
             if ((Get-EffectiveTheme) -ne $script:ThemeName) { Apply-Theme }
         }
+        if (Receive-CodexScan) { Update-TargetList }
         Check-Reset
         $acted = $false
         if ($script:ArmedFor -and $script:Config.AutoResume -and
@@ -1383,6 +1875,7 @@ $timer.Add_Tick({
 
 $form.Add_FormClosed({
     $timer.Stop()
+    if ($script:ScanPS) { try { $script:ScanPS.Stop(); $script:ScanPS.Dispose() } catch { } }
     $tray.Visible = $false
     $tray.Dispose()
     [void][CodexResume.Power]::SetThreadExecutionState($ES_CONTINUOUS)
@@ -1390,7 +1883,12 @@ $form.Add_FormClosed({
 
 Save-Config
 Apply-Theme
-Refresh-Limits
 Update-UI
-$timer.Start()
+# The first scan can take a moment; show the window ("Reading Codex logs...") first.
+$form.Add_Shown({
+    $form.Refresh()
+    Refresh-Limits
+    Update-UI
+    $timer.Start()
+})
 [Windows.Forms.Application]::Run($form)

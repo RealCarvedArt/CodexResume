@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install PSScriptAnalyzer (pinned)
+        shell: powershell
+        run: Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force -Repository PSGallery
+      - name: Lint and security rules (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./tools/ci/Invoke-Lint.ps1 -Path CodexResume.ps1, tools/ci/Invoke-Lint.ps1, tools/ci/Test-Hostile.ps1
+      - name: Hostile-input test (session files, config, prompt)
+        shell: powershell
+        run: ./tools/ci/Test-Hostile.ps1 -Script CodexResume.ps1
+
+  secrets:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: gitleaks (pinned binary, checksum verified, full history)
+        shell: pwsh
+        run: |
+          $v = '8.30.1'
+          $sha = 'd29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e'
+          Invoke-WebRequest "https://github.com/gitleaks/gitleaks/releases/download/v$v/gitleaks_${v}_windows_x64.zip" -OutFile gl.zip
+          if ((Get-FileHash gl.zip -Algorithm SHA256).Hash.ToLower() -ne $sha) { throw 'gitleaks checksum mismatch' }
+          Expand-Archive gl.zip gl
+          ./gl/gitleaks.exe git . --redact --no-banner
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
