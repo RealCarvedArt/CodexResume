@@ -97,6 +97,19 @@ $noLen = Convert-Window ([pscustomobject]@{ used_percent = 99
                                             resets_at = ([DateTimeOffset]$t.AddDays(30)).ToUnixTimeSeconds() }) $t
 Check 'reset 30 days out with no window length is dropped' ($null -eq $noLen.ResetAt)
 
+# 4a. After the 5-hour window resets, an old usage-limit error must not move
+#     the wait to the weekly reset, and a reset that has arrived is not replaced.
+$script:Config = @{ LimitThreshold = 99; AutoResume = $true; BufferSeconds = 60 }
+$now = Get-Date
+$five = [pscustomobject]@{ Used = 100; ResetAt = $now.AddMinutes(-1) }
+$week = [pscustomobject]@{ Used = 40;  ResetAt = $now.AddDays(5) }
+$l = [pscustomobject]@{ Primary = $five; Secondary = $week; LimitHitAt = $now.AddHours(-4) }
+Check 'old limit error is cleared by the 5-hour reset' ($null -eq (Get-BlockingReset $l))
+$l.LimitHitAt = $now.AddSeconds(-10)
+Check 'limit error after the reset still counts' ((Get-BlockingReset $l) -eq $week.ResetAt)
+$five.ResetAt = $now.AddHours(2); $l.LimitHitAt = $now.AddMinutes(-5)
+Check 'limit error before the reset waits for the fullest window' ((Get-BlockingReset $l) -eq $five.ResetAt)
+
 # 4b. A program run through cmd.exe never gets characters cmd.exe would change.
 $cmdStub = Join-Path $work 'codex.cmd'; Set-Content $cmdStub '@echo off'
 function Resolve-Codex { $cmdStub }

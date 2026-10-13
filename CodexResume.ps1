@@ -757,16 +757,20 @@ function Get-RateLimits {
 
 # A window is blocking when it reaches the threshold. If both are, wait for the
 # later reset. If Codex logged a usage-limit error but no window is over the
-# threshold, the fullest window is the one that ran out.
+# threshold, the fullest window is the one that ran out. A window that has
+# reset since that error cleared it, so the error no longer counts.
 function Get-BlockingReset($l) {
     if (-not $l) { return $null }
     $now = Get-Date
     $th = [double]$script:Config.LimitThreshold
     if ($th -le 0 -or $th -gt 100) { $th = 99 }
-    $w = @($l.Primary, $l.Secondary) | Where-Object { $_ -and $_.ResetAt -and $_.ResetAt -gt $now }
+    $all = @($l.Primary, $l.Secondary) | Where-Object { $_ -and $_.ResetAt }
+    $w = @($all | Where-Object { $_.ResetAt -gt $now })
     if (-not $w) { return $null }
     $b = @($w | Where-Object { $_.Used -ge $th })
-    if (-not $b -and $l.LimitHitAt) { $b = @($w | Sort-Object Used -Descending | Select-Object -First 1) }
+    $hit = $l.LimitHitAt
+    if ($hit -and @($all | Where-Object { $_.ResetAt -gt $hit -and $_.ResetAt -le $now }).Count) { $hit = $null }
+    if (-not $b -and $hit) { $b = @($w | Sort-Object Used -Descending | Select-Object -First 1) }
     if (-not $b) { return $null }
     ($b | Sort-Object ResetAt -Descending | Select-Object -First 1).ResetAt
 }
@@ -1075,8 +1079,11 @@ function Refresh-Limits {
     }
     # Only arm when we see a reset that is still in the future, so stale data
     # from an old session never triggers a surprise resume.
+    # A reset that has already arrived is never replaced: the timer continues
+    # once BufferSeconds have passed.
     $r = Get-BlockingReset $script:Limits
-    if ($r -and $r -gt (Get-Date) -and $script:ArmedFor -ne $r) {
+    $due = $script:Config.AutoResume -and $script:ArmedFor -and $script:ArmedFor -le (Get-Date)
+    if ($r -and $r -gt (Get-Date) -and $script:ArmedFor -ne $r -and -not $due) {
         $script:ArmedFor = $r
         Write-Log ('Armed: limit resets at {0:G}' -f $r)
     }
